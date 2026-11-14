@@ -126,6 +126,50 @@ curl -sS http://localhost:8000/stations/S1/daily/2026-11-01
 
 返回该站点每个观测的当前有效修订，用于追查来源。
 
+### `POST /stations/merge` — 合并换编号的站点
+
+雨量站更换编号后，旧编号的断网补报仍会到达。把旧站（`source`）并入新站
+（`target`）后，两个编号共享同一份观测和日报：
+
+```bash
+curl -sS -X POST http://localhost:8000/stations/merge \
+  -H 'content-type: application/json' \
+  -d '{"source_station_id": "OLD1", "target_station_id": "NEW1"}'
+```
+
+成功返回（HTTP 200）：
+
+```json
+{
+  "source_station_id": "OLD1",
+  "target_station_id": "NEW1",
+  "canonical_station_id": "NEW1",
+  "already_merged": false,
+  "source_observations": 2,
+  "merged_observations": 4,
+  "affected_dates": ["2026-11-01"]
+}
+```
+
+- 两站的同一观测 ID 保留较高修订；同修订号且内容完全相同视为重复，只留
+  一份。
+- 合并成功后重算目标站日报（`affected_dates` 为发生变化的日期），旧编号
+  成为**持久别名**：后续用任一编号上传、查询观测或日报，都作用于合并结果；
+  响应中的 `station_id` 为合并后的目标编号。
+- 同一对编号重试是幂等空操作：返回 `already_merged: true`，不重复迁移。
+  反向提交同一对编号亦然。别名指向的站点再次并入其它站时，旧别名自动
+  重定向到最新编号（别名不成链）。
+- 也接受 `sourceStationId` / `targetStationId`、`old_station_id` /
+  `new_station_id` 等写法。源与目标相同返回 422。
+
+下列情况整次拒绝（HTTP 409，`error.code` 为 `merge_rejected`），两边观测、
+日报和别名全部保持原样，修正后可直接重试：
+
+- 同一观测 ID 在两站修订号相同但内容不同（`revision_conflict`）；
+- 合并后同一时刻出现两条有效观测（`duplicate_active_observation`）；
+- 合并后出现未标记复位的累计倒退
+  （`cumulative_regression_without_reset`）。
+
 ### `GET /health`
 
 健康检查。
@@ -171,15 +215,25 @@ curl -sS http://localhost:8000/stations/S1/daily/2026-11-01
 
 重算后不再有任何贡献读数的日期会被删除，查询时表现为 0 mm。
 
+### 站点合并与别名
+
+- 合并与上传一样在单个 `BEGIN IMMEDIATE` 事务内完成：先取写锁再读两站
+  状态，因此合并与上传并发时按提交顺序判定——先提交的上传会被一起迁移，
+  后提交的上传自动落到别名指向的目标站。失败整体回滚，不会留下别名或
+  部分日报。
+- 上传在事务内解析别名，因此同一批次里混用新旧编号也会写到同一份数据上。
+- 别名存于 `station_aliases` 表，随 SQLite 数据持久化，服务重启后仍然
+  有效。
+
 ## 项目结构
 
 ```
 app/
-  main.py       FastAPI 应用、错误处理、路由
+  main.py       FastAPI 应用、错误处理、路由（含站点合并）
   models.py     Pydantic 请求/响应模型与输入别名
-  rainfall.py   校验、修订合并、日雨量计算、事务
-  db.py         SQLite 连接与 schema
-  errors.py     批次拒绝异常
+  rainfall.py   校验、修订合并、站点合并、日雨量计算、事务
+  db.py         SQLite 连接与 schema（观测、日报、站点别名）
+  errors.py     批次拒绝与合并拒绝异常
 tests/          端到端测试（FastAPI TestClient）
 Dockerfile
 docker-compose.yml

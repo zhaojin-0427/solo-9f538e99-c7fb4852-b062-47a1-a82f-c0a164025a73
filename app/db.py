@@ -39,6 +39,21 @@ CREATE TABLE IF NOT EXISTS daily_rainfall (
     updated_at       TEXT NOT NULL,
     PRIMARY KEY (station_id, day)
 );
+
+-- A station that was merged into another station keeps its old id as a
+-- durable alias.  Aliases always point at a canonical station id: when a
+-- canonical station is itself merged away, every alias that aimed at it is
+-- redirected to the new target in the same transaction, so aliases never
+-- form chains.
+CREATE TABLE IF NOT EXISTS station_aliases (
+    alias_station_id   TEXT NOT NULL,
+    target_station_id  TEXT NOT NULL,
+    merged_at          TEXT NOT NULL,
+    PRIMARY KEY (alias_station_id)
+);
+
+CREATE INDEX IF NOT EXISTS station_aliases_by_target
+    ON station_aliases (target_station_id);
 """
 
 DEFAULT_DATABASE_PATH = "./data/rainfall.db"
@@ -128,6 +143,28 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         except sqlite3.Error:
             # The transaction may already have been rolled back; the original
             # exception is the one worth propagating.
+            pass
+        raise
+    conn.execute("COMMIT")
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Give a multi-statement read one consistent snapshot.
+
+    Resolving a station alias and then reading that station's rows is two
+    statements; a merge committing between them could otherwise produce a
+    torn view.  A deferred transaction keeps both statements on the same
+    snapshot without blocking writers.
+    """
+
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
             pass
         raise
     conn.execute("COMMIT")

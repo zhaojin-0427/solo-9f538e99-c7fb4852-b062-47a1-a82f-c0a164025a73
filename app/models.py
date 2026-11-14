@@ -112,6 +112,71 @@ class ObservationsUpload(BaseModel):
         return value
 
 
+class StationMergeRequest(BaseModel):
+    """Merge a renamed station's old id (source) into its successor (target).
+
+    Field aliases mirror the observation upload so that camelCase clients
+    and old/new naming work without a translation layer.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    source_station_id: str = Field(
+        min_length=1,
+        max_length=100,
+        validation_alias=_choice(
+            "source_station_id",
+            "sourceStationId",
+            "source",
+            "old_station_id",
+            "oldStationId",
+        ),
+    )
+    target_station_id: str = Field(
+        min_length=1,
+        max_length=100,
+        validation_alias=_choice(
+            "target_station_id",
+            "targetStationId",
+            "target",
+            "new_station_id",
+            "newStationId",
+        ),
+    )
+
+    @field_validator("source_station_id", "target_station_id")
+    @classmethod
+    def _strip_identifier(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def _ids_must_differ(self) -> "StationMergeRequest":
+        if self.source_station_id == self.target_station_id:
+            raise ValueError("source and target station ids must differ")
+        return self
+
+
+class StationMergeResponse(BaseModel):
+    """Outcome of a station merge.
+
+    ``already_merged`` is true when the pair had already been merged (the
+    source id already resolves to the target), in which case nothing was
+    migrated again.  ``canonical_station_id`` is the station id that now
+    holds the combined history.
+    """
+
+    source_station_id: str
+    target_station_id: str
+    canonical_station_id: str
+    already_merged: bool
+    source_observations: int
+    merged_observations: int
+    affected_dates: list[date]
+
+
 class UploadedObservation(BaseModel):
     observation_id: str
     station_id: str

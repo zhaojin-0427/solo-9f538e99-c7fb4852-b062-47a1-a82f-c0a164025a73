@@ -14,8 +14,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .db import Database
-from .errors import BatchRejected
+from .db import Database, read_transaction
+from .errors import BatchRejected, MergeRejected
 from .models import (
     DailyRainfallResponse,
     ErrorDetail,
@@ -23,6 +23,8 @@ from .models import (
     HealthResponse,
     ObservationUploadResult,
     ObservationsUpload,
+    StationMergeRequest,
+    StationMergeResponse,
     StationObservationsResponse,
     UploadedObservation,
     UploadResponse,
@@ -31,6 +33,8 @@ from .rainfall import (
     get_daily_rainfall,
     ingest_batch,
     list_station_observations,
+    merge_stations,
+    resolve_station,
 )
 
 logger = logging.getLogger("rainfall")
@@ -87,6 +91,24 @@ def create_app(database: Database | None = None) -> FastAPI:
                     message=(
                         "The batch was rejected and no observations or daily "
                         "results were changed."
+                    ),
+                    details=exc.violations,
+                )
+            ).model_dump(mode="json"),
+        )
+
+    @app.exception_handler(MergeRejected)
+    async def _merge_rejected_handler(
+        _: Request, exc: MergeRejected
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=ErrorResponse(
+                error=ErrorDetail(
+                    code="merge_rejected",
+                    message=(
+                        "The merge was rejected and no observations, daily "
+                        "results, or station aliases were changed."
                     ),
                     details=exc.violations,
                 )
@@ -168,16 +190,53 @@ def create_app(database: Database | None = None) -> FastAPI:
             affected_dates=outcome["affected_dates"],
         )
 
+    @app.post(
+        "/stations/merge",
+        response_model=StationMergeResponse,
+        status_code=status.HTTP_200_OK,
+        tags=["stations"],
+        summary="Merge a renamed station's old id into its successor",
+    )
+    def merge_station(
+        payload: StationMergeRequest,
+        database: Database = Depends(get_db),
+    ) -> StationMergeResponse:
+        """Combine two station ids into one observation and daily history.
+
+        Observations from both stations are combined under the target id
+        (the higher revision wins for a shared observation id), the target's
+        daily results are recomputed, and the old id becomes a durable
+        alias: later uploads and queries under either id share the merged
+        result.  The merge is atomic -- a conflict (same revision with
+        different content, a duplicate active instant, or an unflagged
+        cumulative regression in the combined history) rejects the whole
+        merge and leaves both stations untouched.  Retrying an
+        already-merged pair is a no-op.
+        """
+
+        with database.connection() as conn:
+            outcome = merge_stations(
+                conn, payload.source_station_id, payload.target_station_id
+            )
+
+        return StationMergeResponse(
+            source_station_id=payload.source_station_id,
+            target_station_id=payload.target_station_id,
+            **outcome,
+        )
+
     def _daily_response(
         station_id: str, day: date, database: Database
     ) -> DailyRainfallResponse:
         with database.connection() as conn:
-            result = get_daily_rainfall(conn, station_id, day)
+            with read_transaction(conn):
+                canonical_id = resolve_station(conn, station_id)
+                result = get_daily_rainfall(conn, canonical_id, day)
         if result is None:
             # A day with no contributing reading is 0 mm with no contributing
             # observations, not 404: absence of rain is a trustworthy answer.
             return DailyRainfallResponse(
-                station_id=station_id,
+                station_id=canonical_id,
                 date=day,
                 rainfall_mm=0.0,
                 observation_ids=[],
@@ -223,13 +282,19 @@ def create_app(database: Database | None = None) -> FastAPI:
         station_id: str = Path(min_length=1, max_length=100),
         database: Database = Depends(get_db),
     ) -> StationObservationsResponse:
-        """Show the current revision of every observation for traceability."""
+        """Show the current revision of every observation for traceability.
+
+        A merged station's old id resolves to its successor, and the
+        response carries the canonical station id.
+        """
 
         with database.connection() as conn:
-            rows = list_station_observations(conn, station_id)
+            with read_transaction(conn):
+                canonical_id = resolve_station(conn, station_id)
+                rows = list_station_observations(conn, canonical_id)
 
         return StationObservationsResponse(
-            station_id=station_id,
+            station_id=canonical_id,
             observations=[UploadedObservation(**row) for row in rows],
         )
 

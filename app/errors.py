@@ -17,6 +17,19 @@ class BatchRejected(Exception):
         super().__init__(f"batch rejected with {len(violations)} violation(s)")
 
 
+class MergeRejected(Exception):
+    """Raised when a station merge violates an integrity rule.
+
+    Carries the same violation dictionaries as ``BatchRejected``.  The merge
+    runs in a single transaction, so a rejection leaves both stations'
+    observations, daily results and the alias table untouched.
+    """
+
+    def __init__(self, violations: list[dict[str, Any]]) -> None:
+        self.violations = violations
+        super().__init__(f"merge rejected with {len(violations)} violation(s)")
+
+
 def violation(code: str, message: str, **context: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {"code": code, "message": message}
     payload.update({key: value for key, value in context.items() if value is not None})

@@ -16,6 +16,12 @@ Design notes
 * **Atomicity** -- the entire batch (including recomputation of daily sums)
   runs in one SQLite transaction.  Any rejection leaves prior observations and
   prior daily results untouched.
+* **Station merge** -- a renamed station's old id is merged into its
+  successor in one immediate transaction: observations are combined (higher
+  revision wins on a shared id), the merged state must satisfy the same
+  invariants as an upload, the target's daily results are recomputed, and
+  the old id becomes a durable alias.  Uploads and queries resolve aliases
+  to the canonical station, and retrying a merged pair is a no-op.
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from .db import write_transaction
-from .errors import BatchRejected, violation
+from .errors import BatchRejected, MergeRejected, violation
 from .models import ObservationIn
 
 UNCHANGED = "unchanged"
@@ -126,6 +132,30 @@ def _fetch_station_observations(
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def resolve_station(conn: sqlite3.Connection, station_id: str) -> str:
+    """Return the canonical station id, following merge aliases.
+
+    Aliases always point at a canonical station (aliases that aimed at a
+    station which is itself merged away are redirected inside the merge
+    transaction), so resolution is normally a single lookup; the loop only
+    guards against corrupted data.
+    """
+
+    current = station_id
+    for _ in range(32):
+        row = conn.execute(
+            "SELECT target_station_id FROM station_aliases "
+            "WHERE alias_station_id = ?",
+            (current,),
+        ).fetchone()
+        if row is None:
+            return current
+        current = row["target_station_id"]
+    raise RuntimeError(  # pragma: no cover - indicates corrupted alias data
+        f"station alias cycle detected at {station_id!r}"
+    )
 
 
 def _resolve_batch_duplicates(
@@ -306,6 +336,66 @@ def _apply_batch(
     return results, dirty
 
 
+def _find_state_violations(
+    station_id: str, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Check the cross-observation invariants for one station's rows.
+
+    ``rows`` may come straight from the database or from an in-memory merge
+    of two stations; retracted rows are ignored by both checks.
+    """
+
+    violations: list[dict[str, Any]] = []
+
+    active = [row for row in rows if not row["is_retracted"]]
+    active.sort(key=lambda row: (row["observed_at"], row["observation_id"]))
+
+    # 1. At most one active observation per instant.
+    by_instant: dict[str, list[str]] = defaultdict(list)
+    for row in active:
+        by_instant[row["observed_at"]].append(row["observation_id"])
+    for instant, ids in sorted(by_instant.items()):
+        if len(ids) > 1:
+            violations.append(
+                violation(
+                    "duplicate_active_observation",
+                    "two active observations share the same station and instant",
+                    station_id=station_id,
+                    observed_at=instant,
+                    observation_ids=sorted(ids),
+                )
+            )
+
+    # 2. Within a reset-to-reset segment the cumulative counter must not
+    #    decrease.  A reset establishes a fresh baseline at its own
+    #    reading, so any value before it is irrelevant; the reset reading
+    #    itself is compared against nothing.  Checking against the highest
+    #    reading in the segment (rather than only the predecessor) catches
+    #    a reversal that a later reading partly hides.
+    segment_high: Decimal | None = None
+    for row in active:
+        current = Decimal(row["cumulative_mm"])
+        if row["is_reset"]:
+            segment_high = current
+            continue
+        if segment_high is not None and current < segment_high:
+            violations.append(
+                violation(
+                    "cumulative_regression_without_reset",
+                    "cumulative rainfall decreased without a reset flag",
+                    station_id=station_id,
+                    observed_at=row["observed_at"],
+                    observation_id=row["observation_id"],
+                    cumulative_mm=row["cumulative_mm"],
+                    previous_cumulative_mm=decimal_to_string(segment_high),
+                )
+            )
+        if segment_high is None or current > segment_high:
+            segment_high = current
+
+    return violations
+
+
 def _validate_station_state(conn: sqlite3.Connection, station_ids: Iterable[str]) -> None:
     """Check cross-observation invariants after staging the batch.
 
@@ -316,55 +406,11 @@ def _validate_station_state(conn: sqlite3.Connection, station_ids: Iterable[str]
     violations: list[dict[str, Any]] = []
 
     for station_id in sorted(station_ids):
-        active = [
-            row
-            for row in _fetch_station_observations(conn, station_id)
-            if not row["is_retracted"]
-        ]
-        active.sort(key=lambda row: (row["observed_at"], row["observation_id"]))
-
-        # 1. At most one active observation per instant.
-        by_instant: dict[str, list[str]] = defaultdict(list)
-        for row in active:
-            by_instant[row["observed_at"]].append(row["observation_id"])
-        for instant, ids in sorted(by_instant.items()):
-            if len(ids) > 1:
-                violations.append(
-                    violation(
-                        "duplicate_active_observation",
-                        "two active observations share the same station and instant",
-                        station_id=station_id,
-                        observed_at=instant,
-                        observation_ids=sorted(ids),
-                    )
-                )
-
-        # 2. Within a reset-to-reset segment the cumulative counter must not
-        #    decrease.  A reset establishes a fresh baseline at its own
-        #    reading, so any value before it is irrelevant; the reset reading
-        #    itself is compared against nothing.  Checking against the highest
-        #    reading in the segment (rather than only the predecessor) catches
-        #    a reversal that a later reading partly hides.
-        segment_high: Decimal | None = None
-        for row in active:
-            current = Decimal(row["cumulative_mm"])
-            if row["is_reset"]:
-                segment_high = current
-                continue
-            if segment_high is not None and current < segment_high:
-                violations.append(
-                    violation(
-                        "cumulative_regression_without_reset",
-                        "cumulative rainfall decreased without a reset flag",
-                        station_id=station_id,
-                        observed_at=row["observed_at"],
-                        observation_id=row["observation_id"],
-                        cumulative_mm=row["cumulative_mm"],
-                        previous_cumulative_mm=decimal_to_string(segment_high),
-                    )
-                )
-            if segment_high is None or current > segment_high:
-                segment_high = current
+        violations.extend(
+            _find_state_violations(
+                station_id, _fetch_station_observations(conn, station_id)
+            )
+        )
 
     if violations:
         raise BatchRejected(violations)
@@ -481,7 +527,17 @@ def ingest_batch(
 
     observations = list(observations)
     with write_transaction(conn):
-        results, dirty = _apply_batch(conn, observations)
+        # Backfill keeps arriving under a merged station's old id; route it
+        # to the canonical station.  Resolution happens inside the immediate
+        # transaction so a concurrent merge cannot change the mapping after
+        # this batch has validated against it.
+        resolved = [
+            obs.model_copy(
+                update={"station_id": resolve_station(conn, obs.station_id)}
+            )
+            for obs in observations
+        ]
+        results, dirty = _apply_batch(conn, resolved)
         _validate_station_state(conn, dirty)
         affected_days = _refresh_daily_results(conn, dirty)
 
@@ -495,9 +551,155 @@ def ingest_batch(
     }
 
 
+def _merge_observation_rows(
+    source_rows: list[dict[str, Any]],
+    target_rows: list[dict[str, Any]],
+    target_station_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Combine two stations' observations into one effective set.
+
+    For an observation id present in both stations the higher revision wins;
+    identical content at the same revision is a harmless duplicate; different
+    content at the same revision is a conflict that rejects the merge.
+    """
+
+    violations: list[dict[str, Any]] = []
+    merged: dict[str, dict[str, Any]] = {}
+
+    for row in [*target_rows, *source_rows]:
+        observation_id = row["observation_id"]
+        existing = merged.get(observation_id)
+        if existing is None:
+            merged[observation_id] = row
+            continue
+        if int(row["revision"]) > int(existing["revision"]):
+            merged[observation_id] = row
+        elif int(row["revision"]) < int(existing["revision"]):
+            continue
+        elif _state_payload(row) != _state_payload(existing):
+            violations.append(
+                violation(
+                    "revision_conflict",
+                    "the same revision exists in both stations with "
+                    "different content",
+                    station_id=target_station_id,
+                    observation_id=observation_id,
+                    revision=int(row["revision"]),
+                )
+            )
+
+    if violations:
+        return [], violations
+    return list(merged.values()), []
+
+
+def merge_stations(
+    conn: sqlite3.Connection, source_station_id: str, target_station_id: str
+) -> dict[str, Any]:
+    """Merge a renamed station's old id into its successor.
+
+    All observations of both stations are combined under the target id and
+    the target's daily results are recomputed; the old id becomes a durable
+    alias, so later uploads and queries under either id share the merged
+    result.  The whole merge runs in one immediate transaction: a concurrent
+    upload either commits first (and is migrated along with the source) or
+    applies afterwards against the alias, and a rejected merge changes
+    nothing -- no alias is recorded and no daily result is touched.
+    """
+
+    with write_transaction(conn):
+        source = resolve_station(conn, source_station_id)
+        target = resolve_station(conn, target_station_id)
+
+        if source == target:
+            # The pair was already merged: retrying must not migrate twice.
+            return {
+                "canonical_station_id": target,
+                "already_merged": True,
+                "source_observations": 0,
+                "merged_observations": len(
+                    _fetch_station_observations(conn, target)
+                ),
+                "affected_dates": [],
+            }
+
+        source_rows = _fetch_station_observations(conn, source)
+        target_rows = _fetch_station_observations(conn, target)
+
+        merged_rows, violations = _merge_observation_rows(
+            source_rows, target_rows, target
+        )
+        if violations:
+            raise MergeRejected(violations)
+
+        state_violations = _find_state_violations(target, merged_rows)
+        if state_violations:
+            raise MergeRejected(state_violations)
+
+        # Restage the combined observation set under the target id.  Both
+        # stations' rows are replaced inside this transaction, so a failure
+        # anywhere below restores them exactly.
+        conn.execute(
+            "DELETE FROM observations WHERE station_id IN (?, ?)",
+            (source, target),
+        )
+        for row in merged_rows:
+            conn.execute(
+                """
+                INSERT INTO observations (
+                    station_id, observation_id, revision, observed_at,
+                    observed_day, cumulative_mm, is_reset, is_retracted, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target,
+                    row["observation_id"],
+                    int(row["revision"]),
+                    row["observed_at"],
+                    row["observed_day"],
+                    row["cumulative_mm"],
+                    1 if row["is_reset"] else 0,
+                    1 if row["is_retracted"] else 0,
+                    _now(),
+                ),
+            )
+        conn.execute(
+            "DELETE FROM daily_rainfall WHERE station_id = ?", (source,)
+        )
+        affected_days = _refresh_daily_results(conn, {target})
+
+        # The old id becomes a durable alias.  Aliases that pointed at the
+        # source follow it to the new canonical id, so aliases never chain.
+        conn.execute(
+            "UPDATE station_aliases SET target_station_id = ? "
+            "WHERE target_station_id = ?",
+            (target, source),
+        )
+        conn.execute(
+            """
+            INSERT INTO station_aliases (
+                alias_station_id, target_station_id, merged_at
+            ) VALUES (?, ?, ?)
+            ON CONFLICT (alias_station_id) DO UPDATE SET
+                target_station_id = excluded.target_station_id,
+                merged_at = excluded.merged_at
+            """,
+            (source, target, _now()),
+        )
+
+    return {
+        "canonical_station_id": target,
+        "already_merged": False,
+        "source_observations": len(source_rows),
+        "merged_observations": len(merged_rows),
+        "affected_dates": sorted(affected_days),
+    }
+
+
 def get_daily_rainfall(
     conn: sqlite3.Connection, station_id: str, day: date
 ) -> dict[str, Any] | None:
+    station_id = resolve_station(conn, station_id)
     row = conn.execute(
         "SELECT * FROM daily_rainfall WHERE station_id = ? AND day = ?",
         (station_id, day.isoformat()),
@@ -515,6 +717,7 @@ def get_daily_rainfall(
 def list_station_observations(
     conn: sqlite3.Connection, station_id: str
 ) -> list[dict[str, Any]]:
+    station_id = resolve_station(conn, station_id)
     rows = conn.execute(
         "SELECT * FROM observations WHERE station_id = ? "
         "ORDER BY observed_at, observation_id",
