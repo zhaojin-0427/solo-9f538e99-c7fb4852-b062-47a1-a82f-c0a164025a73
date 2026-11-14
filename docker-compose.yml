@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: rainfall-api:latest
+    container_name: rainfall-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/rainfall.db
+    volumes:
+      - rainfall-data:/data
+    restart: unless-stopped
+
+volumes:
+  rainfall-data:
